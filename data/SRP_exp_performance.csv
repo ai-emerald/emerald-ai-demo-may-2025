@@ -1,0 +1,8 @@
+Model,Performance,Flexibility
+ft_llama_8b_p3-c6rr6ijz ,0.939635,Flex 2
+infer_llama_8b_32g-ssac4bap ,0.973165,Flex 3
+infer_llama_8b_48g-hgfu2h87,1,Flex 1
+infer_llama_8b_48g-xhganfr6  ,0.992455,Flex 2
+pt_mpt_13b_sm-gnn16mkt ,0.666923,Flex 3
+pt_mpt_7b_fast-qryepi9o ,0.743277,Flex 3
+Weighted Performance,0.909560245,

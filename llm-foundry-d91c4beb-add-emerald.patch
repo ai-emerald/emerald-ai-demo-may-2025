@@ -1,0 +1,222 @@
+# Copyright (c) 2025 Emerald AI
+# SPDX-License-Identifier: Apache-2.0
+diff --git a/emerald/__init__.py b/emerald/__init__.py
+new file mode 100644
+index 0000000..3c3057b
+--- /dev/null
++++ b/emerald/__init__.py
+@@ -0,0 +1,4 @@
++# This module is symlinked into llmfoundry so that it is accessible inside
++# that package, but also accessible outside of it.
++# We do this because for the control_power.py script, we want to avoid
++# running llmfoundry/__init__.py, which might have complicated effects.
+\ No newline at end of file
+diff --git a/emerald/control_power.py b/emerald/control_power.py
+new file mode 100644
+index 0000000..0a3586d
+--- /dev/null
++++ b/emerald/control_power.py
+@@ -0,0 +1,59 @@
++import logging
++import subprocess
++import sys
++from time import sleep
++
++from controls import get_emerald_controls
++
++
++def main() -> None:
++    logging.basicConfig(
++        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
++        level=logging.DEBUG,
++        stream=sys.stdout,
++    )
++    logger = logging.getLogger(__name__)
++
++    min_max_csv = subprocess.run(
++        "nvidia-smi --query-gpu power.min_limit,power.max_limit --format=csv,nounits",
++        capture_output=True,
++        check=True,
++        shell=True,
++        text=True,
++    ).stdout.strip()
++    data = min_max_csv.split("\n")[1]
++    min_power, max_power = (float(d) for d in data.split(","))
++    logger.info(f"Power limit range: {min_power} W - {max_power} W")
++    last_cap = 0
++    while True:
++        sleep(10)
++        try:
++            controls = get_emerald_controls()
++            power_cap = controls.get("power_cap")
++            # Always want to set cap to max at the beginning; could have some leftover cap
++            if not power_cap:
++                power_cap = max_power
++            if power_cap != last_cap:
++                logger.info(f"Power cap changed {last_cap} -> {power_cap}")
++                last_cap = power_cap
++                if power_cap > max_power:
++                    logger.warning(
++                        f"Power cap {power_cap} W exceeds max power limit {max_power} W"
++                    )
++                    power_cap = max_power
++                if power_cap < min_power:
++                    logger.warning(
++                        f"Power cap {power_cap} W below min power limit {min_power} W"
++                    )
++                    power_cap = min_power
++                subprocess.run(
++                    f"nvidia-smi -pl {power_cap}",
++                    check=True,
++                    shell=True,
++                )
++        except Exception:
++            logger.exception("Error in power control loop.")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/emerald/controls.py b/emerald/controls.py
+new file mode 100644
+index 0000000..370ce05
+--- /dev/null
++++ b/emerald/controls.py
+@@ -0,0 +1,11 @@
++
++import os
++from typing import Any
++from pymemcache.client.base import Client
++from pymemcache import serde
++
++memcache = Client(os.environ['MEMCACHED_HOST'], serde=serde.pickle_serde)
++
++def get_emerald_controls() -> dict[str, Any]:
++    name = os.environ['EMERALD_CONTROL_NAME']
++    return memcache.get(name) or {}
+diff --git a/llmfoundry/callbacks/emerald_callback.py b/llmfoundry/callbacks/emerald_callback.py
+new file mode 100644
+index 0000000..ec6fdf4
+--- /dev/null
++++ b/llmfoundry/callbacks/emerald_callback.py
+@@ -0,0 +1,36 @@
++from __future__ import annotations
++
++from functools import lru_cache
++import logging
++from random import Random, SystemRandom
++from time import sleep
++from typing import Any
++from composer.core import Callback, State
++from composer.loggers import Logger
++from llmfoundry.emerald.controls import get_emerald_controls
++
++log = logging.getLogger(__name__)
++
++__all__ = ['EmeraldCallback']
++
++
++class EmeraldCallback(Callback):
++    def batch_end(self, state: State, logger: Logger) -> None:
++        controls = self.controls(state.timestamp.batch)
++        # In practice it seems to be safe to issue this at the same time
++        # as checkpoint_now; the checkpoint will always be done before
++        # shutting down.
++        if controls.get('shutdown', False):
++            log.info("Shutting down at request.")
++            state.stop_training()
++
++    @staticmethod
++    @lru_cache(1)
++    def controls(batch_num: int) -> dict[str, Any]:
++        try:
++            controls = get_emerald_controls()
++            log.info("controls: %s", controls)
++            return controls
++        except Exception:
++            log.exception("Failed to get emerald controls from memcache.")
++        return {}
+diff --git a/llmfoundry/command_utils/train.py b/llmfoundry/command_utils/train.py
+index 8fb833d..25059bf 100644
+--- a/llmfoundry/command_utils/train.py
++++ b/llmfoundry/command_utils/train.py
+@@ -5,12 +5,15 @@ import logging
+ import os
+ import time
+ import warnings
+-from typing import Any, Optional, Union
++from typing import TYPE_CHECKING, Any, Optional, Union
++
++from llmfoundry.callbacks.emerald_callback import EmeraldCallback
+ 
+ import torch
+ import torch.distributed
+ from composer import ComposerModel, Trainer
+ from composer.callbacks.checkpoint_saver import CheckpointSaver
++from composer.core import Event, State
+ from composer.core.callback import Callback
+ from composer.profiler import (
+     JSONTraceHandler,
+@@ -19,6 +22,7 @@ from composer.profiler import (
+     cyclic_schedule,
+ )
+ from composer.utils import TPConfig, dist, get_device, reproducibility
++from composer.utils.misc import create_interval_scheduler
+ from omegaconf import DictConfig
+ from omegaconf import OmegaConf as om
+ 
+@@ -440,6 +444,7 @@ def train(cfg: DictConfig) -> Trainer:
+             train_config=logged_cfg,
+         ) for name, callback_cfg in callback_configs.items()
+     ]
++    callbacks.append(EmeraldCallback())
+ 
+     use_async_eval = any(isinstance(c, AsyncEval) for c in callbacks)
+ 
+@@ -551,6 +556,17 @@ def train(cfg: DictConfig) -> Trainer:
+         e.location = EvalDataLoaderLocation
+         raise e
+ 
++    orig_save_interval = create_interval_scheduler(train_cfg.save_interval)
++    def save_interval_fn(state: State, event: Event) -> bool:
++        inst = EmeraldCallback.controls(state.timestamp.batch)
++        if inst.get('checkpoint_now', False):
++            log.info("Checkpointing by request.")
++            return True
++        orig_result = orig_save_interval(state, event)
++        if orig_result:
++            log.info("Checkpointing on schedule.")
++        return orig_result
++
+     compile_config = train_cfg.compile_config
+     # Build the Trainer
+     log.info('Building trainer...')
+@@ -578,7 +594,7 @@ def train(cfg: DictConfig) -> Trainer:
+         save_folder=train_cfg.save_folder,
+         save_filename=save_filename,
+         save_latest_filename=save_latest_filename,
+-        save_interval=train_cfg.save_interval,
++        save_interval=save_interval_fn,
+         save_num_checkpoints_to_keep=train_cfg.save_num_checkpoints_to_keep,
+         save_overwrite=train_cfg.save_overwrite,
+         save_weights_only=train_cfg.save_weights_only,
+diff --git a/llmfoundry/emerald b/llmfoundry/emerald
+new file mode 120000
+index 0000000..bf106d4
+--- /dev/null
++++ b/llmfoundry/emerald
+@@ -0,0 +1 @@
++../emerald/
+\ No newline at end of file
+diff --git a/setup.py b/setup.py
+index 3621d4e..aced62c 100644
+--- a/setup.py
++++ b/setup.py
+@@ -74,6 +74,8 @@ install_requires = [
+     'catalogue>=2,<3',
+     'typer<1',
+     'GitPython==3.1.43',
++    # Emerald additions
++    'pymemcache==4.0.0',
+ ]
+ 
+ extra_deps = {}
